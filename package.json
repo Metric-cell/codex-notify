@@ -1,0 +1,16 @@
+{
+  "name": "codex-notify",
+  "displayName": "Codex Notify",
+  "description": "Provides the current VS Code workspace and window-specific links to Codex notifications in WSL.",
+  "version": "0.1.0",
+  "publisher": "optane",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": { "untrustedWorkspaces": { "supported": true } },
+  "scripts": { "test": "node --test test/extension.test.js" }
+}

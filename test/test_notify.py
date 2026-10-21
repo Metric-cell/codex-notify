@@ -1,0 +1,109 @@
+import base64
+from contextlib import contextmanager, redirect_stderr
+from http.server import BaseHTTPRequestHandler
+import io
+import json
+import os
+from pathlib import Path
+import socketserver
+import sys
+from tempfile import TemporaryDirectory
+import threading
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import notify_windows
+
+
+THREAD_ID = "01a15cd3-a530-7090-93b1-d680f92ccd62"
+
+
+@contextmanager
+def bridge(cli_socket, result):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+        def log_message(self, *args):
+            pass
+
+    with socketserver.UnixStreamServer(cli_socket + ".notify", Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            server.shutdown()
+            worker.join()
+
+
+def details_for(event):
+    with patch.object(notify_windows.subprocess, "run") as run:
+        notify_windows.notify(event)
+        script = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16le")
+        payload = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
+        return json.loads(base64.b64decode(payload)), script
+
+
+class NotifyTests(unittest.TestCase):
+    def test_originating_socket_selects_window_even_when_working_directories_match(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory:
+            first = directory + "/first.sock"
+            second = directory + "/second.sock"
+            for cli, name, window_id in [(first, "MM", 1), (second, "paper-research", 5)]:
+                url = f"vscode://openai.chatgpt/local/{THREAD_ID}?windowId={window_id}"
+                with bridge(cli, {"workspace": name, "url": url}), patch.dict(os.environ, {"VSCODE_IPC_HOOK_CLI": cli}):
+                    details, _ = details_for({"type": "agent-turn-complete", "thread-id": THREAD_ID, "cwd": "/same/directory"})
+                    self.assertEqual(details["workspace"], name)
+                    self.assertEqual(details["url"], url)
+
+    def test_unavailable_bridge_keeps_notification_without_guessing_window(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"VSCODE_IPC_HOOK_CLI": directory + "/missing.sock"}), redirect_stderr(io.StringIO()) as errors:
+            details, script = details_for({"type": "agent-turn-complete", "thread-id": THREAD_ID, "cwd": "/misleading/name"})
+            self.assertIsNone(details["workspace"])
+            self.assertIsNone(details["url"])
+            self.assertNotIn("misleading", script)
+            self.assertIn("unavailable", errors.getvalue())
+
+    def test_unexpected_callback_and_malformed_responses_are_rejected(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory:
+            for number, response in enumerate([
+                {"workspace": "MM", "url": "https://example.com"},
+                {"workspace": "MM", "url": "vscode://openai.chatgpt/local/wrong-thread"},
+                {"workspace": "MM", "url": 42},
+                [],
+            ]):
+                cli = directory + f"/{number}.sock"
+                with bridge(cli, response), patch.dict(os.environ, {"VSCODE_IPC_HOOK_CLI": cli}), redirect_stderr(io.StringIO()):
+                    self.assertEqual(notify_windows.window_context(THREAD_ID), {})
+
+    def test_index_uses_latest_title_and_tolerates_partial_records(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"CODEX_HOME": directory}):
+            self.assertEqual(notify_windows.session_name(THREAD_ID), "未命名会话")
+            title = "中文 <&> ' $(throw 'bad')"
+            records = [json.dumps({"id": THREAD_ID, "thread_name": "old"}), "null", json.dumps({"id": THREAD_ID, "thread_name": title}), "{partial"]
+            Path(directory, "session_index.jsonl").write_text("\n".join(records), encoding="utf-8")
+            self.assertEqual(notify_windows.session_name(THREAD_ID), title)
+
+    def test_special_titles_are_data_and_identifiers_are_not_visible(self):
+        title = "中文 <&> ' $(throw 'bad')"
+        window = {"workspace": "工作区 <&>", "url": f"vscode://openai.chatgpt/local/{THREAD_ID}?windowId=1"}
+        with patch.object(notify_windows, "session_name", return_value=title), patch.object(notify_windows, "window_context", return_value=window):
+            details, script = details_for({"type": "agent-turn-complete", "thread-id": THREAD_ID})
+            self.assertEqual(details["name"], title)
+            self.assertNotIn(title, script)
+            self.assertNotIn("id", details)
+            self.assertNotIn("ID：", script)
+
+    def test_other_events_do_not_query_or_notify(self):
+        with patch.object(notify_windows, "window_context") as query, patch.object(notify_windows.subprocess, "run") as run:
+            notify_windows.notify({"type": "approval-requested"})
+            query.assert_not_called()
+            run.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
