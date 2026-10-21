@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socketserver
+import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import threading
@@ -41,7 +42,7 @@ def bridge(cli_socket, result):
 
 
 def details_for(event):
-    with patch.object(notify_windows.subprocess, "run") as run:
+    with patch.object(notify_windows, "is_user_session", return_value=True), patch.object(notify_windows.subprocess, "run") as run:
         notify_windows.notify(event)
         script = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16le")
         payload = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
@@ -49,6 +50,51 @@ def details_for(event):
 
 
 class NotifyTests(unittest.TestCase):
+    @contextmanager
+    def session_database(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"CODEX_HOME": directory}):
+            with sqlite3.connect(Path(directory) / "state_5.sqlite") as connection:
+                connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT)")
+                connection.executemany("INSERT INTO threads VALUES (?, ?)", [
+                    (THREAD_ID, "vscode"),
+                    ("main-cli", "cli"),
+                    ("child", json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": THREAD_ID, "depth": 1}}})),
+                    ("grandchild", json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": "child", "depth": 2}}})),
+                    ("review", json.dumps({"subagent": "review"})),
+                    ("unknown", "unknown"),
+                ])
+            yield
+
+    def test_only_user_sessions_are_allowed(self):
+        with self.session_database():
+            for thread in (THREAD_ID, "main-cli"):
+                self.assertTrue(notify_windows.is_user_session(thread))
+            for thread in ("child", "grandchild", "review", "unknown", "missing", None, "' OR 1=1 --"):
+                self.assertFalse(notify_windows.is_user_session(thread))
+
+    def test_subagents_do_not_query_window_or_send_notifications(self):
+        with self.session_database(), patch.object(notify_windows, "window_context") as query, patch.object(notify_windows.subprocess, "run") as run:
+            for thread in ("child", "grandchild", "review", "missing", None):
+                notify_windows.notify({"type": "agent-turn-complete", "thread-id": thread})
+            query.assert_not_called()
+            run.assert_not_called()
+
+    def test_primary_sessions_still_notify(self):
+        with self.session_database(), patch.object(notify_windows, "window_context", return_value={}), patch.object(notify_windows.subprocess, "run") as run:
+            for thread in (THREAD_ID, "main-cli"):
+                notify_windows.notify({"type": "agent-turn-complete", "thread-id": thread})
+            self.assertEqual(run.call_count, 2)
+
+    def test_missing_or_incompatible_database_does_not_create_files_or_notify(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"CODEX_HOME": directory}), redirect_stderr(io.StringIO()), patch.object(notify_windows.subprocess, "run") as run:
+            notify_windows.notify({"type": "agent-turn-complete", "thread-id": THREAD_ID})
+            database = Path(directory) / "state_5.sqlite"
+            self.assertFalse(database.exists())
+            with sqlite3.connect(database):
+                pass
+            notify_windows.notify({"type": "agent-turn-complete", "thread-id": THREAD_ID})
+            run.assert_not_called()
+
     def test_originating_socket_selects_window_even_when_working_directories_match(self):
         with TemporaryDirectory(prefix="notify-test-") as directory:
             first = directory + "/first.sock"

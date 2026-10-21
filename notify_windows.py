@@ -2,14 +2,28 @@
 """Show a Windows toast when a Codex turn finishes in WSL."""
 
 import base64
+from contextlib import closing
 import http.client
 import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 from urllib.parse import quote, urlsplit
+
+
+def is_user_session(thread_id):
+    # shortcut: Codex's current state schema; update if its database version changes.
+    database = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "state_5.sqlite"
+    try:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
+            row = connection.execute("SELECT source FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    except sqlite3.Error as error:
+        print(f"Codex Notify: cannot verify session source ({error}); notification skipped.", file=sys.stderr)
+        return False
+    return row is not None and row[0] in ("vscode", "cli")
 
 
 def session_name(thread_id):
@@ -61,7 +75,9 @@ def window_context(thread_id):
 def notify(event):
     if event.get("type") != "agent-turn-complete":
         return
-    thread_id = event.get("thread-id") or "未知会话"
+    thread_id = event.get("thread-id")
+    if not is_user_session(thread_id):
+        return
     window = window_context(thread_id)
     details = base64.b64encode(json.dumps({
         "name": session_name(thread_id),
