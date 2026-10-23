@@ -25,6 +25,12 @@
 
 `notify` 是 Codex 的用户级设置，不能放进项目的 `.codex/config.toml`；详见 [Codex 官方配置文档](https://developers.openai.com/codex/config-advanced/)。
 
+### 从 0.2.0 及更早版本升级
+
+从 0.2.1 开始，扩展 ID 由 `optane.codex-notify` 改为 `Metric-cell.codex-notify`。VS Code 会把它们视为两个扩展，不会自动迁移；同时启用时，窗口桥接和命令会冲突。
+
+先卸载旧的 `optane.codex-notify`，再安装新版，并执行 **Developer: Reload Window**。重新运行 **Codex Notify: Copy Codex Configuration**，替换用户配置中的旧 `notify` 行，因为新扩展的脚本存储路径也随 ID 改变。CLI 用户还需新建集成终端。
+
 ## 窗口与会话行为
 
 扩展在 WSL 工作区扩展宿主中运行，每个窗口创建权限为 `0600` 的 Unix 套接字。Codex 扩展宿主中的进程优先使用与自身 `VSCODE_IPC_HOOK_CLI` 对应的桥接；集成终端通过专用环境变量 `CODEX_NOTIFY_SOCKET` 找到所属窗口，避免继承其他窗口的连接。选定桥接后连接失败时，不尝试其他窗口。工作区名称来自 `vscode.workspace.name`，返回链接由 `vscode.env.asExternalUri()` 生成。
@@ -56,14 +62,14 @@
 npm ci
 npm test
 npm run package
-code --install-extension ./codex-notify-0.2.0.vsix
+code --install-extension ./codex-notify-0.2.1.vsix
 ```
 
 测试覆盖主会话筛选、损坏索引、标题兜底、无窗口降级、错误处理、安装命令，以及 Python 与 Node.js 实际 Unix 套接字通信。Windows 通知投递和点击返回需要在 WSL / Windows 上手动验证。
 
 使用官方 `@vscode/vsce` 打包，只包含运行文件、文档和 MIT 许可证。GitHub Actions 会执行测试和打包，并保留 VSIX 构建产物。
 
-公开发布前，需要确认 `package.json` 的 `publisher` 对应自己的 [Visual Studio Marketplace 发布者](https://code.visualstudio.com/api/working-with-extensions/publishing-extension)。GitHub 账号与 Marketplace 发布者是不同身份；当前 `optane` 沿用本地扩展标识，尚未验证 Marketplace 归属。变更发布者后需重新复制配置。首次发布前，还应手动验证两个窗口打开同一目录、集成终端 CLI、Codex 扩展会话和关闭原窗口后的行为。
+`package.json` 的 `publisher` 已统一为 `Metric-cell`，与作者和 GitHub 仓库身份一致。公开发布前，需在 [Visual Studio Marketplace](https://marketplace.visualstudio.com/manage) 创建或确认归自己管理的同名发布者；GitHub 身份不代表 Marketplace ID 已注册或归自己所有。如果最终注册其他 ID，需同步修改 `publisher`、重新打包，并更新 Release 安装包。首次发布前，还应手动验证两个窗口打开同一目录、集成终端 CLI、Codex 扩展会话和关闭原窗口后的行为。[官方发布流程](https://code.visualstudio.com/api/working-with-extensions/publishing-extension)
 
 ## 许可证
 

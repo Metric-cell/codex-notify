@@ -2,8 +2,8 @@
   "name": "codex-notify",
   "displayName": "Codex Notify",
   "description": "Windows completion notifications for Codex in WSL, with session titles and links back to the originating VS Code window.",
-  "version": "0.2.0",
-  "publisher": "optane",
+  "version": "0.2.1",
+  "publisher": "Metric-cell",
   "private": true,
   "license": "MIT",
   "engines": {
