@@ -1,5 +1,5 @@
 import base64
-from contextlib import contextmanager, redirect_stderr
+from contextlib import closing, contextmanager, redirect_stderr
 from http.server import BaseHTTPRequestHandler
 import io
 import json
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socketserver
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
@@ -50,10 +51,97 @@ def details_for(event):
 
 
 class NotifyTests(unittest.TestCase):
+    def test_explicit_test_notification_needs_no_session_and_has_no_callback(self):
+        with patch.object(notify_windows, "is_user_session") as source, patch.object(notify_windows, "window_context") as context, patch.object(notify_windows.subprocess, "run") as run:
+            self.assertEqual(notify_windows.main(["--test"]), 0)
+            source.assert_not_called()
+            context.assert_not_called()
+            script = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16le")
+            payload = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
+            details = json.loads(base64.b64decode(payload))
+            self.assertEqual(details["name"], "测试通知")
+            self.assertIsNone(details["url"])
+            self.assertIsNone(details["workspace"])
+
+    def test_corrupt_utf8_index_and_database_title_fallback(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"CODEX_HOME": directory}):
+            index = Path(directory, "session_index.jsonl")
+            index.write_bytes(json.dumps({"id": THREAD_ID, "thread_name": "earlier"}).encode() + b'\n{"thread_name":"\xe4\xb8')
+            self.assertEqual(notify_windows.session_name(THREAD_ID), "earlier")
+            with closing(sqlite3.connect(Path(directory, "state_5.sqlite"))) as connection, connection:
+                connection.execute("CREATE TABLE threads (id TEXT, title TEXT)")
+                connection.execute("INSERT INTO threads VALUES (?, ?)", (THREAD_ID, "database title"))
+            for data in (b'\xff', b'{}', json.dumps({"id": THREAD_ID, "thread_name": 42}).encode()):
+                index.write_bytes(data)
+                self.assertEqual(notify_windows.session_name(THREAD_ID), "database title")
+            index.unlink()
+            self.assertEqual(notify_windows.session_name(THREAD_ID), "database title")
+
+    def test_socket_selection_uses_direct_bridge_or_terminal_export_without_guessing(self):
+        with TemporaryDirectory(prefix="notify-test-") as directory:
+            cli = directory + "/legacy"
+            dedicated = directory + "/dedicated"
+            context = {"workspace": "dedicated", "url": f"vscode://openai.chatgpt/local/{THREAD_ID}"}
+            with bridge(dedicated, context), patch.dict(os.environ, {
+                "CODEX_NOTIFY_SOCKET": dedicated + ".notify", "VSCODE_IPC_HOOK_CLI": cli,
+            }):
+                self.assertEqual(notify_windows.window_context(THREAD_ID), context)
+            with patch.dict(os.environ, {
+                "CODEX_NOTIFY_SOCKET": dedicated + ".notify", "VSCODE_IPC_HOOK_CLI": cli,
+            }), redirect_stderr(io.StringIO()):
+                self.assertEqual(notify_windows.window_context(THREAD_ID), {})
+            Path(dedicated + ".notify").unlink()
+            direct_context = {**context, "workspace": "direct"}
+            with bridge(cli, direct_context), bridge(dedicated, context), patch.dict(os.environ, {
+                "CODEX_NOTIFY_SOCKET": dedicated + ".notify", "VSCODE_IPC_HOOK_CLI": cli,
+            }):
+                self.assertEqual(notify_windows.window_context(THREAD_ID), direct_context)
+            Path(dedicated + ".notify").unlink()
+            with bridge(dedicated, context), patch.dict(os.environ, {
+                "CODEX_NOTIFY_SOCKET": dedicated + ".notify", "VSCODE_IPC_HOOK_CLI": cli,
+            }), redirect_stderr(io.StringIO()):
+                self.assertEqual(notify_windows.window_context(THREAD_ID), {})
+
+    def test_relative_codex_home_supports_source_and_database_title(self):
+        with self.session_database(), patch.dict(os.environ, {"CODEX_HOME": os.path.relpath(os.environ["CODEX_HOME"])}):
+            self.assertTrue(notify_windows.is_user_session(THREAD_ID))
+            self.assertEqual(notify_windows.session_name(THREAD_ID), "未命名会话")
+
+    def test_invalid_cli_and_payload_fail_without_side_effects(self):
+        with patch.object(notify_windows, "is_user_session") as source, patch.object(notify_windows.subprocess, "run") as run, redirect_stderr(io.StringIO()) as errors:
+            for args in ([], ["{}", "{}"], ["{"], ["null"], ["[]"], ['{"type": 1}']):
+                self.assertEqual(notify_windows.main(args), 1)
+            for thread in (None, "", " ", 42, [], {}):
+                self.assertEqual(notify_windows.main([json.dumps({"type": "agent-turn-complete", "thread-id": thread})]), 1)
+            source.assert_not_called()
+            run.assert_not_called()
+            self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_powershell_errors_return_failure_without_tracebacks(self):
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired("powershell", 15), subprocess.CalledProcessError(7, "powershell"), PermissionError(13, "Permission denied")):
+            with patch.object(notify_windows, "is_user_session", return_value=True), patch.object(notify_windows, "window_context", return_value={}), patch.object(notify_windows, "session_name", return_value="title"), patch.object(notify_windows.subprocess, "run", side_effect=error), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(notify_windows.main([json.dumps({"type": "agent-turn-complete", "thread-id": THREAD_ID})]), 1)
+                self.assertIn("PowerShell", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_powershell_failure_preserves_stderr_diagnostic(self):
+        error = subprocess.CalledProcessError(7, "powershell", stderr=b"Windows notifications are disabled")
+        with patch.object(notify_windows.subprocess, "run", side_effect=error), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(notify_windows.main(["--test"]), 1)
+            self.assertIn("Windows notifications are disabled", errors.getvalue())
+
+    def test_display_text_is_xml_safe_and_command_is_bounded(self):
+        title = "\x00\x01\ud800\ufffe" + "长" * 10000
+        with patch.object(notify_windows, "session_name", return_value=title), patch.object(notify_windows, "window_context", return_value={"workspace": title}):
+            details, script = details_for({"type": "agent-turn-complete", "thread-id": THREAD_ID})
+            self.assertEqual(details["name"], "长" * 256)
+            self.assertEqual(details["workspace"], "长" * 256)
+            self.assertLess(len(base64.b64encode(script.encode("utf-16le"))), 30000)
+
     @contextmanager
     def session_database(self):
         with TemporaryDirectory(prefix="notify-test-") as directory, patch.dict(os.environ, {"CODEX_HOME": directory}):
-            with sqlite3.connect(Path(directory) / "state_5.sqlite") as connection:
+            with closing(sqlite3.connect(Path(directory) / "state_5.sqlite")) as connection, connection:
                 connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT)")
                 connection.executemany("INSERT INTO threads VALUES (?, ?)", [
                     (THREAD_ID, "vscode"),
@@ -90,7 +178,7 @@ class NotifyTests(unittest.TestCase):
             notify_windows.notify({"type": "agent-turn-complete", "thread-id": THREAD_ID})
             database = Path(directory) / "state_5.sqlite"
             self.assertFalse(database.exists())
-            with sqlite3.connect(database):
+            with closing(sqlite3.connect(database)):
                 pass
             notify_windows.notify({"type": "agent-turn-complete", "thread-id": THREAD_ID})
             run.assert_not_called()
