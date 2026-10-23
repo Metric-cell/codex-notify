@@ -15,7 +15,7 @@
 
 ## 安装与配置
 
-1. 在连接到 WSL 的 VS Code 窗口安装扩展，确认扩展安装在 WSL 端。
+1. 从 [GitHub Releases](https://github.com/Metric-cell/codex-notify/releases/latest) 下载 `.vsix` 安装包。在连接到 WSL 的 VS Code 窗口，打开扩展面板菜单，选择 **Install from VSIX…**，并确认扩展安装在 WSL 端。
 2. 在命令面板运行 **Codex Notify: Copy Codex Configuration**。
 3. 将复制的 `notify = [...]` 行粘贴到 WSL 中的用户配置 `$CODEX_HOME/config.toml`；未设置 `CODEX_HOME` 时是 `~/.codex/config.toml`。放在文件顶层、任何 `[table]` 之前，并替换已有的 `notify`，不要重复添加。
 4. 运行 **Codex Notify: Send Test Notification**，确认 Windows 能显示测试通知。
